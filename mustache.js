@@ -11,20 +11,18 @@ var Mustache = function() {
     otag: "{{",
     ctag: "}}",
     pragmas: {},
-    buffer: [],
     pragmas_implemented: {
       "IMPLICIT-ITERATOR": true
     },
-    context: {},
     compiled_templates: {},
 
-    render: function(template, context, partials) {
+    render: function(template, global_context, partial_context, partials) {
       var compiled_template = this.compiled_templates[template];
       if (compiled_template == null) {
         compiled_template = this.compile_template(template, partials);
         this.compiled_templates[template] = compiled_template;
       }
-      return compiled_template.call(this, context, partials);
+      return compiled_template.call(this, global_context, partial_context, partials);
     },
 
     compile_template: function(template, partials) {
@@ -32,6 +30,16 @@ var Mustache = function() {
         return function() { return template };
       }
 
+      var compiled_template = this.compile_sections_and_tags(template, partials);
+      var function_body =
+        "var buff = '';\n" +
+        "var context = Mustache.aug(global_context, partial_context);\n" +
+        compiled_template + "\n" +
+        "return buff;";
+      return new Function("global_context", "partial_context", "partials", function_body);
+    },
+
+    compile_sections_and_tags: function(template, partials) {
       // get the pragmas together
       template = this.precompile_pragmas(template);
 
@@ -42,17 +50,7 @@ var Mustache = function() {
       if (compiled_template == null) {
         compiled_template = this.compile_tags(template, partials);
       }
-      var function_body = "var buff = '';\n" + compiled_template + "\n return buff;";
-      return new Function("context", "partials", function_body);
-    },
-
-    sendLines: function(text) {
-      if (text) {
-        var lines = text.split("\n");
-        for (var i = 0; i < lines.length; i++) {
-          this.send(lines[i]);
-        }
-      }
+      return compiled_template;
     },
 
     /*
@@ -118,7 +116,7 @@ var Mustache = function() {
         var compiled_before = before ? that.compile_tags(before, partials) : "",
 
         // after may contain both sections and tags, so use full rendering function
-            compiled_after = after ? that.compile_template(after, partials) : "",
+            compiled_after = after ? that.compile_sections_and_tags(after, partials) : "",
 
         // will be computed below
             compiled_content = "";
@@ -130,7 +128,7 @@ var Mustache = function() {
         if (type === "^") { // inverted section
           compiled_content = compiled_content.concat(
             "if (!value || Mustache.is_array(value) && value.length === 0) {\n" +
-              that.compile_template(content, partials) + // false or empty list, render it
+              that.compile_sections_and_tags(content, partials) + // false or empty list, render it
             "}"
           )
         } else if (type === "#") { // normal section
@@ -142,17 +140,23 @@ var Mustache = function() {
           compiled_content = compiled_content.concat(
             "if (Mustache.is_array(value)) { // Enumerable, Let's loop!\n" +
             "  for (var i = 0; i < value.length; i++) {\n" +
-            "    buff = buff.concat(this.render(content, Mustache.aug(context, {\"" + iterator + "\": value[i]}), partials))\n" +
+            "    buff = buff.concat(\n" +
+            "      this.render(\n" +
+            "        content,\n" +
+            "        global_context,\n" +
+            "        Mustache.is_object(value[i]) ? value[i] : {\"" + iterator + "\": value[i]},\n" +
+            "        partials))\n" +
             "  }\n" +
             "} else if (Mustache.is_object(value)) { // Object, Use it as subcontext!\n" +
-            "    buff = buff.concat(this.render(content, value, partials))\n" +
+            "    buff = buff.concat(this.render(content, global_context, value, partials))\n" +
             "} else if (typeof value === \"function\") {\n" +
             "  // higher order section\n" +
-            "  renderedContent = value.call(context, content, function(text) {\n" +
-            "    buff = buff.concat(this.render(text, context, partials));\n" +
-            "  });\n" +
+            "  var that = this;\n" +
+            "  buff = buff.concat(value.call(context, content, function(text) {\n" +
+            "    return that.render(text, global_context, partial_context, partials);\n" +
+            "  }));\n" +
             "} else if (value) { // boolean section\n" +
-            "    buff = buff.concat(this.render(content, context, partials));\n" +
+            "    buff = buff.concat(this.render(content, global_context, partial_context, partials));\n" +
             "}\n"
           )
         }
@@ -173,7 +177,7 @@ var Mustache = function() {
 
       var new_regex = function() {
         return new RegExp("^([\\s\\S]*?)" + that.otag + "(=|!|>|\\{|%)?([^\\/#\\^]+?)\\1?" +
-          that.ctag + "\([\\s\\S]*)$", "g");
+          that.ctag + "+\([\\s\\S]*)$", "g");
       };
 
       var regex = new_regex();
@@ -191,7 +195,10 @@ var Mustache = function() {
           break;
         case ">": // render partial
           var name = Mustache.trim(name);
-          compiled_content = "buff = buff.concat(this.render(\"" + Mustache.escape_quotes(partials[name]) + "\", Mustache.aug(context, context[\"" + name + "\"], partials)));\n";
+          compiled_content =
+            "var potential_context_for_partial = context[\"" + name + "\"];\n" +
+            "var context_for_partial = Mustache.is_object(potential_context_for_partial) ? potential_context_for_partial : partial_context;\n" +
+            "buff = buff.concat(this.render(\"" + Mustache.escape_quotes(partials[name]) + "\", global_context, context_for_partial, partials));\n";
           break;
         case "{": // the triple mustache is unescaped
           compiled_content = "buff = buff.concat(Mustache.find(\"" + name + "\", context));\n";
@@ -199,7 +206,7 @@ var Mustache = function() {
         default: // escape the value
           compiled_content = "buff = buff.concat(Mustache.escape_html(Mustache.find(\"" + name + "\", context)));\n";
         }
-        return compiled_before + "\n" + compiled_content + "\n" + compiled_after;
+        return compiled_before +  compiled_content +  compiled_after;
       };
       return template.replace(regex, tag_replace_callback)
     },
@@ -241,7 +248,7 @@ var Mustache = function() {
     */
     to_html: function(template, view, partials, send_fun) {
       var renderer = new Renderer();
-      var result = renderer.render(template, view || {}, partials);
+      var result = renderer.render(template, view || {}, {}, partials);
       if (send_fun) {
         return send_fun(result);
       } else {
@@ -294,7 +301,7 @@ Mustache.trim = function(s) {
 };
 
 Mustache.escape_quotes = function(str) {
-  str = str.replace(/"/g, "\"");
+  str = str.replace(/"/g, "\\\"");
   str = str.replace(/\n/g, "\\n");
   return str;
 };

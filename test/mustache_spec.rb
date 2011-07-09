@@ -71,7 +71,6 @@ describe "mustache" do
     non_partials.each do |testname|
       describe testname do
         it "should generate the correct html" do
-
           view, template, expect = load_test(__DIR__, testname)
 
           runner = <<-JS
@@ -86,12 +85,10 @@ describe "mustache" do
             }
           JS
 
-          if expect =~ /Bear/ && run_js(@run_js, runner) != expect
-            puts runner
-          end
+          run_js(@run_js, runner).strip.should == expect.strip
         end
-        it "should sendFun the correct html" do
 
+        it "should sendFun the correct html" do
           view, template, expect = load_test(__DIR__, testname)
 
           runner = <<-JS
@@ -137,7 +134,7 @@ describe "mustache" do
             }
           JS
 
-          run_js(@run_js, runner).should == expect
+          run_js(@run_js, runner).strip.should == expect.strip
         end
         it "should sendFun the correct html" do
 
