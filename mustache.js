@@ -16,49 +16,34 @@ var Mustache = function() {
       "IMPLICIT-ITERATOR": true
     },
     context: {},
+    compiled_templates: {},
 
-    render: function(template, context, partials, in_recursion) {
-      // reset buffer & set context
-      if(!in_recursion) {
-        this.context = context;
-        this.buffer = []; // TODO: make this non-lazy
+    render: function(template, context, partials) {
+      var compiled_template = this.compiled_templates[template];
+      if (compiled_template == null) {
+        compiled_template = this.compile_template(template, partials);
+        this.compiled_templates[template] = compiled_template;
       }
+      return compiled_template.call(this, context, partials);
+    },
 
-      // fail fast
-      if(!this.includes("", template)) {
-        if(in_recursion) {
-          return template;
-        } else {
-          this.send(template);
-          return;
-        }
+    compile_template: function(template, partials) {
+      if (!this.includes("", template)) { // template is a constant string
+        return function() { return template };
       }
 
       // get the pragmas together
-      template = this.render_pragmas(template);
+      template = this.precompile_pragmas(template);
 
       // render the template
-      var html = this.render_section(template, context, partials);
+      var compiled_template = this.compile_sections(template, partials)
 
       // render_section did not find any sections, we still need to render the tags
-      if (html === false) {
-        html = this.render_tags(template, context, partials, in_recursion);
+      if (compiled_template == null) {
+        compiled_template = this.compile_tags(template, partials);
       }
-
-      if (in_recursion) {
-        return html;
-      } else {
-        this.sendLines(html);
-      }
-    },
-
-    /*
-      Sends parsed lines
-    */
-    send: function(line) {
-      if(line != "") {
-        this.buffer.push(line);
-      }
+      var function_body = "var buff = '';\n" + compiled_template + "\n return buff;";
+      return new Function("context", "partials", function_body);
     },
 
     sendLines: function(text) {
@@ -73,7 +58,7 @@ var Mustache = function() {
     /*
       Looks for %PRAGMAS
     */
-    render_pragmas: function(template) {
+    precompile_pragmas: function(template) {
       // no pragmas
       if(!this.includes("%", template)) {
         return template;
@@ -99,26 +84,12 @@ var Mustache = function() {
     },
 
     /*
-      Tries to find a partial in the curent scope and render it
-    */
-    render_partial: function(name, context, partials) {
-      name = this.trim(name);
-      if(!partials || partials[name] === undefined) {
-        throw({message: "unknown_partial '" + name + "'"});
-      }
-      if(typeof(context[name]) != "object") {
-        return this.render(partials[name], context, partials, true);
-      }
-      return this.render(partials[name], context[name], partials, true);
-    },
-
-    /*
       Renders inverted (^) and normal (#) sections
     */
-    render_section: function(template, context, partials) {
+    compile_sections: function(template, partials) {
       if(!this.includes("#", template) && !this.includes("^", template)) {
         // did not render anything, there were no sections
-        return false;
+        return null;
       }
 
       var that = this;
@@ -144,87 +115,93 @@ var Mustache = function() {
       // for each {{#foo}}{{/foo}} section do...
       return template.replace(regex, function(match, before, type, name, content, after) {
         // before contains only tags, no sections
-        var renderedBefore = before ? that.render_tags(before, context, partials, true) : "",
+        var compiled_before = before ? that.compile_tags(before, partials) : "",
 
         // after may contain both sections and tags, so use full rendering function
-            renderedAfter = after ? that.render(after, context, partials, true) : "",
+            compiled_after = after ? that.compile_template(after, partials) : "",
 
         // will be computed below
-            renderedContent,
+            compiled_content = "";
 
-            value = that.find(name, context);
+        compiled_content = compiled_content.concat(
+          "var value = Mustache.find(\"" + name + "\", context);\n" +
+          "var content = \"" + Mustache.escape_quotes(content) + "\";\n");
 
         if (type === "^") { // inverted section
-          if (!value || that.is_array(value) && value.length === 0) {
-            // false or empty list, render it
-            renderedContent = that.render(content, context, partials, true);
-          } else {
-            renderedContent = "";
-          }
+          compiled_content = compiled_content.concat(
+            "if (!value || Mustache.is_array(value) && value.length === 0) {\n" +
+              that.compile_template(content, partials) + // false or empty list, render it
+            "}"
+          )
         } else if (type === "#") { // normal section
-          if (that.is_array(value)) { // Enumerable, Let's loop!
-            renderedContent = that.map(value, function(row) {
-              return that.render(content, that.create_context(row), partials, true);
-            }).join("");
-          } else if (that.is_object(value)) { // Object, Use it as subcontext!
-            renderedContent = that.render(content, that.create_context(value),
-              partials, true);
-          } else if (typeof value === "function") {
-            // higher order section
-            renderedContent = value.call(context, content, function(text) {
-              return that.render(text, context, partials, true);
-            });
-          } else if (value) { // boolean section
-            renderedContent = that.render(content, context, partials, true);
-          } else {
-            renderedContent = "";
+          var iterator = ".";
+          if (that.pragmas["IMPLICIT-ITERATOR"]) {
+            iterator = that.pragmas["IMPLICIT-ITERATOR"].iterator;
           }
+
+          compiled_content = compiled_content.concat(
+            "if (Mustache.is_array(value)) { // Enumerable, Let's loop!\n" +
+            "  for (var i = 0; i < value.length; i++) {\n" +
+            "    buff = buff.concat(this.render(content, Mustache.aug(context, {\"" + iterator + "\": value[i]}), partials))\n" +
+            "  }\n" +
+            "} else if (Mustache.is_object(value)) { // Object, Use it as subcontext!\n" +
+            "    buff = buff.concat(this.render(content, value, partials))\n" +
+            "} else if (typeof value === \"function\") {\n" +
+            "  // higher order section\n" +
+            "  renderedContent = value.call(context, content, function(text) {\n" +
+            "    buff = buff.concat(this.render(text, context, partials));\n" +
+            "  });\n" +
+            "} else if (value) { // boolean section\n" +
+            "    buff = buff.concat(this.render(content, context, partials));\n" +
+            "}\n"
+          )
         }
 
-        return renderedBefore + renderedContent + renderedAfter;
+        return compiled_before + compiled_content + compiled_after;
       });
     },
 
     /*
       Replace {{foo}} and friends with values from our view
     */
-    render_tags: function(template, context, partials, in_recursion) {
-      // tit for tat
+    compile_tags: function(template, partials) {
+      if (!this.includes("", template)) {
+        return "buff = buff.concat(\"" + Mustache.escape_quotes(template) + "\");\n"
+      }
+
       var that = this;
 
       var new_regex = function() {
-        return new RegExp(that.otag + "(=|!|>|\\{|%)?([^\\/#\\^]+?)\\1?" +
-          that.ctag + "+", "g");
+        return new RegExp("^([\\s\\S]*?)" + that.otag + "(=|!|>|\\{|%)?([^\\/#\\^]+?)\\1?" +
+          that.ctag + "\([\\s\\S]*)$", "g");
       };
 
       var regex = new_regex();
-      var tag_replace_callback = function(match, operator, name) {
+      var tag_replace_callback = function(match, before, operator, name, after) {
+        var compiled_before = "buff = buff.concat(\"" + Mustache.escape_quotes(before) + "\");\n",
+          compiled_after = that.compile_tags(after, partials);
+          compiled_content = "";
+
         switch(operator) {
         case "!": // ignore comments
-          return "";
+          break;
         case "=": // set new delimiters, rebuild the replace regexp
           that.set_delimiters(name);
           regex = new_regex();
-          return "";
+          break;
         case ">": // render partial
-          return that.render_partial(name, context, partials);
+          var name = Mustache.trim(name);
+          compiled_content = "buff = buff.concat(this.render(\"" + Mustache.escape_quotes(partials[name]) + "\", Mustache.aug(context, context[\"" + name + "\"], partials)));\n";
+          break;
         case "{": // the triple mustache is unescaped
-          return that.find(name, context);
+          compiled_content = "buff = buff.concat(Mustache.find(\"" + name + "\", context));\n";
+          break;
         default: // escape the value
-          return that.escape(that.find(name, context));
+          compiled_content = "buff = buff.concat(Mustache.escape_html(Mustache.find(\"" + name + "\", context)));\n";
         }
+        return compiled_before + "\n" + compiled_content + "\n" + compiled_after;
       };
-      var lines = template.split("\n");
-      for(var i = 0; i < lines.length; i++) {
-        lines[i] = lines[i].replace(regex, tag_replace_callback, this);
-        if(!in_recursion) {
-          this.send(lines[i]);
-        }
-      }
-
-      if(in_recursion) {
-        return lines.join("\n");
-      }
+      return template.replace(regex, tag_replace_callback)
     },
 
     set_delimiters: function(delimiters) {
@@ -247,104 +224,12 @@ var Mustache = function() {
       return text.replace(arguments.callee.sRE, '\\$1');
     },
 
-    /*
-      find `name` in current `context`. That is find me a value
-      from the view object
-    */
-    find: function(name, context) {
-      name = this.trim(name);
-
-      // Checks whether a value is thruthy or false or 0
-      function is_kinda_truthy(bool) {
-        return bool === false || bool === 0 || bool;
-      }
-
-      var value;
-      if(is_kinda_truthy(context[name])) {
-        value = context[name];
-      } else if(is_kinda_truthy(this.context[name])) {
-        value = this.context[name];
-      }
-
-      if(typeof value === "function") {
-        return value.apply(context);
-      }
-      if(value !== undefined) {
-        return value;
-      }
-      // silently ignore unkown variables
-      return "";
-    },
-
     // Utility methods
 
     /* includes tag */
     includes: function(needle, haystack) {
       return haystack.indexOf(this.otag + needle) != -1;
     },
-
-    /*
-      Does away with nasty characters
-    */
-    escape: function(s) {
-      s = String(s === null ? "" : s);
-      return s.replace(/&(?!\w+;)|["'<>\\]/g, function(s) {
-        switch(s) {
-        case "&": return "&amp;";
-        case '"': return '&quot;';
-        case "'": return '&#39;';
-        case "<": return "&lt;";
-        case ">": return "&gt;";
-        default: return s;
-        }
-      });
-    },
-
-    // by @langalex, support for arrays of strings
-    create_context: function(_context) {
-      if(this.is_object(_context)) {
-        return _context;
-      } else {
-        var iterator = ".";
-        if(this.pragmas["IMPLICIT-ITERATOR"]) {
-          iterator = this.pragmas["IMPLICIT-ITERATOR"].iterator;
-        }
-        var ctx = {};
-        ctx[iterator] = _context;
-        return ctx;
-      }
-    },
-
-    is_object: function(a) {
-      return a && typeof a == "object";
-    },
-
-    is_array: function(a) {
-      return Object.prototype.toString.call(a) === '[object Array]';
-    },
-
-    /*
-      Gets rid of leading and trailing whitespace
-    */
-    trim: function(s) {
-      return s.replace(/^\s*|\s*$/g, "");
-    },
-
-    /*
-      Why, why, why? Because IE. Cry, cry cry.
-    */
-    map: function(array, fn) {
-      if (typeof array.map == "function") {
-        return array.map(fn);
-      } else {
-        var r = [];
-        var l = array.length;
-        for(var i = 0; i < l; i++) {
-          r.push(fn(array[i]));
-        }
-        return r;
-      }
-    }
   };
 
   return({
@@ -356,13 +241,89 @@ var Mustache = function() {
     */
     to_html: function(template, view, partials, send_fun) {
       var renderer = new Renderer();
-      if(send_fun) {
-        renderer.send = send_fun;
-      }
-      renderer.render(template, view || {}, partials);
-      if(!send_fun) {
-        return renderer.buffer.join("\n");
+      var result = renderer.render(template, view || {}, partials);
+      if (send_fun) {
+        return send_fun(result);
+      } else {
+        return result;
       }
     }
   });
 }();
+
+/*
+  find `name` in current `context`. That is find me a value
+  from the view object
+*/
+Mustache.find = function(name, context) {
+  name = this.trim(name);
+
+  // Checks whether a value is thruthy or false or 0
+  function is_kinda_truthy(bool) {
+    return bool === false || bool === 0 || bool;
+  }
+
+  var value;
+  if(is_kinda_truthy(context[name])) {
+    value = context[name];
+  }
+
+  if(typeof value === "function") {
+    return value.apply(context);
+  }
+  if(value !== undefined) {
+    return value;
+  }
+  // silently ignore unkown variables
+  return "";
+};
+
+Mustache.is_object = function(a) {
+  return a && typeof a == "object";
+};
+
+Mustache.is_array = function(a) {
+  return Object.prototype.toString.call(a) === '[object Array]';
+};
+
+/*
+  Gets rid of leading and trailing whitespace
+*/
+Mustache.trim = function(s) {
+  return s.replace(/^\s*|\s*$/g, "");
+};
+
+Mustache.escape_quotes = function(str) {
+  str = str.replace(/"/g, "\"");
+  str = str.replace(/\n/g, "\\n");
+  return str;
+};
+
+Mustache.aug = function() {
+  result = {};
+  for (var i = 0; i < arguments.length; i++) {
+    for (var key in arguments[i]) {
+      if (arguments[i].hasOwnProperty(key))
+        result[key] = arguments[i][key];
+    }
+  }
+  return result;
+}
+
+/*
+  Does away with nasty characters
+*/
+Mustache.escape_html = function(s) {
+  s = String(s === null ? "" : s);
+  return s.replace(/&(?!\w+;)|["'<>\\]/g, function(s) {
+    switch(s) {
+    case "&": return "&amp;";
+    case '"': return '&quot;';
+    case "'": return '&#39;';
+    case "<": return "&lt;";
+    case ">": return "&gt;";
+    default: return s;
+    }
+  });
+};
+
