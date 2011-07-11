@@ -20,3 +20,4 @@ Mustache.js wouldn't kick ass if it weren't for these fine souls:
  * Ross Boucher / boucher
  * Matt Sanford / mzsanford
  * Ben Cherry / bcherry
+ * Nick Kallen / nk
