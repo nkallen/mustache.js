@@ -109,6 +109,10 @@ describe "mustache" do
             }
           JS
 
+          if run_js(@run_js, runner).strip != expect.strip
+            puts runner
+          end
+
           run_js(@run_js, runner).strip.should == expect.strip
         end
       end
